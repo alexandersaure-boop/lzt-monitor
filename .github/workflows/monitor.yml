@@ -2,16 +2,13 @@ name: LZT Market Monitor
 
 on:
   schedule:
-    # Every 5 minutes. GitHub's minimum. Actual runs may be delayed a
-    # few minutes during peak load — this is a platform limitation.
     - cron: '*/5 * * * *'
-  workflow_dispatch:   # lets you trigger runs manually from the Actions tab
+  workflow_dispatch:
 
 permissions:
-  contents: write      # needed so the workflow can commit seen_items.json back
+  contents: write
 
 concurrency:
-  # Prevents two runs from stepping on each other if one is slow
   group: lzt-monitor
   cancel-in-progress: false
 
@@ -37,18 +34,27 @@ jobs:
         env:
           LZT_API_TOKEN: ${{ secrets.LZT_API_TOKEN }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          LZT_SEARCH_URL: ${{ secrets.LZT_SEARCH_URL }}    # optional; falls back to the default in the script
+          LZT_SEARCH_URL: ${{ secrets.LZT_SEARCH_URL }}
           RUN_ONCE: '1'
         run: python lzt_monitor.py
 
       - name: Commit updated state
         run: |
-          if [[ -n "$(git status --porcelain seen_items.json)" ]]; then
-            git config user.name  "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add seen_items.json
-            git commit -m "Update seen_items.json [skip ci]"
-            git push
-          else
+          if [[ -z "$(git status --porcelain seen_items.json)" ]]; then
             echo "No state change to commit."
+            exit 0
           fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add seen_items.json
+          git commit -m "Update seen_items.json [skip ci]"
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Push succeeded on attempt $attempt"
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt). Rebasing and retrying..."
+            git pull --rebase origin main || { echo "Rebase failed"; exit 1; }
+          done
+          echo "Failed to push after 5 attempts"
+          exit 1
