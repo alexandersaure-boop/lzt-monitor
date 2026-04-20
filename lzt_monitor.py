@@ -150,21 +150,25 @@ def fmt_price(item: dict) -> str:
 
 
 def extract_target_hours(item: dict) -> str | None:
+    """Hours for TARGET_APP_ID. lzt.market returns these as hours directly,
+    not as Steam-API-standard minutes. If we ever see a huge value, assume
+    someone switched to minutes and convert."""
     sg = item.get("steam_full_games")
     if not isinstance(sg, dict):
         return None
-    lst = sg.get("list") if isinstance(sg.get("list"), dict) else sg
-    if not isinstance(lst, dict):
-        return None
-    entry = lst.get(str(TARGET_APP_ID)) or lst.get(TARGET_APP_ID)
-    if not isinstance(entry, dict):
-        return None
-    mins = entry.get("playtime_forever")
-    if isinstance(mins, (int, float)):
-        return f"{int(mins) // 60}h"
-    hrs = entry.get("hours_played") or entry.get("hours")
-    if hrs is not None:
-        return f"{hrs}h"
+    for container in (sg.get("list"), sg):
+        if not isinstance(container, dict):
+            continue
+        entry = container.get(str(TARGET_APP_ID)) or container.get(TARGET_APP_ID)
+        if not isinstance(entry, dict):
+            continue
+        for field in ("playtime_forever", "hours_played", "hours", "playtime"):
+            val = entry.get(field)
+            if isinstance(val, (int, float)) and val >= 0:
+                # lzt returns hours. Defensive fallback if that ever changes:
+                if val > 50000:
+                    return f"{int(val) // 60}h"
+                return f"{int(val)}h"
     return None
 
 
