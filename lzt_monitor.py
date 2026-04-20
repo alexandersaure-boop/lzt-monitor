@@ -35,14 +35,7 @@ import requests
 
 LZT_API_TOKEN = os.environ.get("LZT_API_TOKEN") or "PASTE_YOUR_LZT_API_TOKEN_HERE"
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL") or "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE"
-SEARCH_URL = os.environ.get("LZT_SEARCH_URL") or (
-    "https://lzt.market/steam/"
-    "?order_by=price_to_up"
-    "&daybreak=30"
-    "&hours_played_min=700"
-    "&nsb=1"
-    "&game[]=221100"
-)
+SEARCH_URL = os.environ.get("LZT_SEARCH_URL") or ("https://lzt.market/steam/dayz/?hours_played[221100]=700&nsb=1&daybreak=30&order_by=price_to_up#title")
 
 # Loop-mode poll interval. Ignored in RUN_ONCE mode.
 POLL_INTERVAL_SECONDS = 120
