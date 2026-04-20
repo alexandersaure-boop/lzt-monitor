@@ -1,0 +1,54 @@
+name: LZT Market Monitor
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub's minimum. Actual runs may be delayed a
+    # few minutes during peak load — this is a platform limitation.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:   # lets you trigger runs manually from the Actions tab
+
+permissions:
+  contents: write      # needed so the workflow can commit seen_items.json back
+
+concurrency:
+  # Prevents two runs from stepping on each other if one is slow
+  group: lzt-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor (one-shot)
+        env:
+          LZT_API_TOKEN: ${{ secrets.LZT_API_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          LZT_SEARCH_URL: ${{ secrets.LZT_SEARCH_URL }}    # optional; falls back to the default in the script
+          RUN_ONCE: '1'
+        run: python lzt_monitor.py
+
+      - name: Commit updated state
+        run: |
+          if [[ -n "$(git status --porcelain seen_items.json)" ]]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add seen_items.json
+            git commit -m "Update seen_items.json [skip ci]"
+            git push
+          else
+            echo "No state change to commit."
+          fi
