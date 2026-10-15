@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-LZT Market Monitor
-------------------
+LZT Market Monitor — Escape from Tarkov
+---------------------------------------
 Polls lzt.market for new listings matching a saved search and posts them
 to Discord via webhook. Only alerts on *new* items (tracked in seen_items.json).
 
@@ -13,6 +13,12 @@ Two run modes:
 Credentials can be supplied either by editing the constants below OR via
 environment variables (LZT_API_TOKEN, DISCORD_WEBHOOK_URL, LZT_SEARCH_URL).
 Env vars win when both are set.
+
+If the search URL changes, the saved state is reset automatically and the
+next run captures a fresh baseline (no flood of alerts).
+
+Set DEBUG_FIELDS=1 to log the field names of the first listing — handy if
+some embed field doesn't show up and you want to see what the API returns.
 """
 
 import json
@@ -35,7 +41,9 @@ import requests
 
 LZT_API_TOKEN = os.environ.get("LZT_API_TOKEN") or "PASTE_YOUR_LZT_API_TOKEN_HERE"
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL") or "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE"
-SEARCH_URL = os.environ.get("LZT_SEARCH_URL") or ("https://lzt.market/steam/dayz/?hours_played[221100]=700&nsb=1&daybreak=30&order_by=price_to_up#title")
+SEARCH_URL = os.environ.get("LZT_SEARCH_URL") or (
+    "https://lzt.market/escape-from-tarkov/?level_min=42&region[]=eu#title"
+)
 
 # Loop-mode poll interval. Ignored in RUN_ONCE mode.
 POLL_INTERVAL_SECONDS = 120
@@ -43,16 +51,16 @@ POLL_INTERVAL_SECONDS = 120
 # If set to "1", run a single cycle and exit (used by GitHub Actions).
 RUN_ONCE = os.environ.get("RUN_ONCE") == "1"
 
+# If set to "1", log the keys of the first listing each cycle.
+DEBUG_FIELDS = os.environ.get("DEBUG_FIELDS") == "1"
+
 STATE_FILE = "seen_items.json"
 LOG_FILE = "monitor.log"
-
-# Target Steam app id used for extracting per-game hours into the Discord embed
-TARGET_APP_ID = 221100
 
 # ============================================================================
 
 API_BASE = "https://api.lzt.market"
-USER_AGENT = "lzt-monitor/1.1 (+personal use)"
+USER_AGENT = "lzt-monitor/1.2 (+personal use)"
 
 # --- graceful Ctrl+C ---
 _running = True
@@ -76,18 +84,25 @@ def log(msg: str) -> None:
 
 # ---------- state ---------------------------------------------------------
 
-def load_state() -> dict:
+def _fresh_state(search_url: str) -> dict:
+    return {"seen": [], "initialized": False, "search_url": search_url}
+
+
+def load_state(search_url: str) -> dict:
     p = Path(STATE_FILE)
     if not p.exists():
-        return {"seen": [], "initialized": False}
+        return _fresh_state(search_url)
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(data, list):       # legacy format
-            return {"seen": data, "initialized": True}
-        return data
     except (json.JSONDecodeError, OSError) as e:
         log(f"⚠ Could not load state ({e}); starting fresh.")
-        return {"seen": [], "initialized": False}
+        return _fresh_state(search_url)
+
+    # Legacy list format, or state saved for a different search → reset.
+    if not isinstance(data, dict) or data.get("search_url") != search_url:
+        log("▶ Search URL changed since last run — resetting baseline.")
+        return _fresh_state(search_url)
+    return data
 
 
 def save_state(state: dict) -> None:
@@ -141,35 +156,21 @@ def fetch_listings(session: requests.Session, api_url: str, query: str):
 
 # ---------- formatting ---------------------------------------------------
 
+def first_field(item: dict, *names):
+    """Return the first non-empty value among the given keys."""
+    for n in names:
+        v = item.get(n)
+        if v not in (None, "", [], {}):
+            return v
+    return None
+
+
 def fmt_price(item: dict) -> str:
     p = item.get("price")
     cur = (item.get("price_currency") or "").upper()
     if p is None:
         return "?"
     return f"{p} {cur}".strip()
-
-
-def extract_target_hours(item: dict) -> str | None:
-    """Hours for TARGET_APP_ID. lzt.market returns these as hours directly,
-    not as Steam-API-standard minutes. If we ever see a huge value, assume
-    someone switched to minutes and convert."""
-    sg = item.get("steam_full_games")
-    if not isinstance(sg, dict):
-        return None
-    for container in (sg.get("list"), sg):
-        if not isinstance(container, dict):
-            continue
-        entry = container.get(str(TARGET_APP_ID)) or container.get(TARGET_APP_ID)
-        if not isinstance(entry, dict):
-            continue
-        for field in ("playtime_forever", "hours_played", "hours", "playtime"):
-            val = entry.get(field)
-            if isinstance(val, (int, float)) and val >= 0:
-                # lzt returns hours. Defensive fallback if that ever changes:
-                if val > 50000:
-                    return f"{int(val) // 60}h"
-                return f"{int(val)}h"
-    return None
 
 
 def build_embed(item: dict) -> dict:
@@ -179,32 +180,28 @@ def build_embed(item: dict) -> dict:
 
     fields = [{"name": "Price", "value": fmt_price(item), "inline": True}]
 
-    target_hrs = extract_target_hours(item)
-    if target_hrs:
-        fields.append({"name": f"Hours (app {TARGET_APP_ID})",
-                       "value": target_hrs, "inline": True})
+    # EFT-specific fields. Several candidate keys are checked so the embed
+    # still works if lzt renames something; missing ones are simply skipped.
+    eft_fields = [
+        ("Level",   ("eft_level", "level")),
+        ("Region",  ("eft_region", "region")),
+        ("Edition", ("eft_version", "eft_edition", "version")),
+        ("Side",    ("eft_side", "side")),
+    ]
+    for label, keys in eft_fields:
+        val = first_field(item, *keys)
+        if val is not None:
+            fields.append({"name": label, "value": str(val).upper()
+                           if label == "Region" else str(val), "inline": True})
 
-    sg = item.get("steam_full_games")
-    if isinstance(sg, dict) and sg.get("total"):
-        fields.append({"name": "Games", "value": str(sg["total"]), "inline": True})
-
-    country = item.get("steam_country") or item.get("account_country")
-    if country:
-        fields.append({"name": "Country", "value": str(country), "inline": True})
-
-    last_act = (item.get("steam_last_activity")
-                or item.get("account_last_activity")
-                or item.get("last_activity"))
+    last_act = first_field(item, "eft_last_activity",
+                           "account_last_activity", "last_activity")
     if last_act:
         try:
             fields.append({"name": "Last active",
                            "value": f"<t:{int(last_act)}:R>", "inline": True})
         except (TypeError, ValueError):
             pass
-
-    mafile = item.get("steam_mafile") or item.get("has_mafile")
-    if mafile:
-        fields.append({"name": "MaFile", "value": "✅", "inline": True})
 
     desc = (item.get("description") or "").strip().replace("\r", "")
     if len(desc) > 500:
@@ -214,7 +211,7 @@ def build_embed(item: dict) -> dict:
         "title": title[:250],
         "url": link,
         "description": desc,
-        "color": 0x00B37E,
+        "color": 0x9A8866,               # Tarkov khaki
         "fields": fields,
         "footer": {"text": f"item_id {item_id}"},
     }
@@ -234,7 +231,7 @@ def send_discord(webhook: str, items: list[dict]) -> None:
         payload = {"embeds": [build_embed(it) for it in chunk]}
         if start == 0:
             n = len(items)
-            payload["content"] = f"🔔 **{n} new listing{'s' if n != 1 else ''}**"
+            payload["content"] = f"🔔 **{n} new EFT listing{'s' if n != 1 else ''}**"
         try:
             r = requests.post(webhook, json=payload, timeout=15)
             if r.status_code == 429:
@@ -260,6 +257,9 @@ def run_cycle(session, api_url: str, query: str, state: dict, seen: set) -> None
         return
 
     items = data["items"]
+    if DEBUG_FIELDS and items:
+        log(f"  [debug] fields on first item: {sorted(items[0].keys())}")
+
     new_items = [i for i in items if i.get("item_id") not in seen]
 
     if not state.get("initialized"):
@@ -304,7 +304,7 @@ def main() -> None:
         "User-Agent": USER_AGENT,
     })
 
-    state = load_state()
+    state = load_state(SEARCH_URL)
     seen = set(state.get("seen", []))
 
     log(f"▶ Monitoring  {api_url}{'?' + query if query else ''}")
